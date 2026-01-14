@@ -36,14 +36,17 @@ class TwipEnv(gym.Env):
         self.action = torch.zeros((2,), device=self.device)
 
         # Defining the scene
-        gs.init(backend=gs.cuda)
+        gs.init(backend=gs.cpu)
+        from genesis.engine.entities import RigidEntity
+
         self.scene = gs.Scene(
             vis_options=gs.options.VisOptions(
                 show_link_frame=True,
-            )
+            ),
+            show_viewer=True
         )
         self.plane = self.scene.add_entity(gs.morphs.Plane())
-        self.twip = self.scene.add_entity(
+        self.twip: RigidEntity = self.scene.add_entity(
             gs.morphs.URDF(file="assets/twip.urdf", pos=[0, 0, 0.1])
         )
 
@@ -51,6 +54,12 @@ class TwipEnv(gym.Env):
         self._motors_dof_idx = [self.twip.get_joint(name).dof_idx_local for name in self._joints_name]
 
         self.scene.build()
+
+        self.twip.set_dofs_force_range(
+            lower=-self._max_torque,
+            upper=self._max_torque,
+            dofs_idx_local=self._motors_dof_idx
+        )
 
         self._init_pos = self.twip.get_pos()
         self._init_quat = self.twip.get_quat()
@@ -61,10 +70,14 @@ class TwipEnv(gym.Env):
         self.twip.control_dofs_force(self.action, self._motors_dof_idx)
         self.scene.step()
 
-        self.obs = self._get_obs()
-        self.rew = self._compute_rew()
         self.dones = self._check_dones()
         self.truncated = False
+
+        if self.dones:
+            self.reset()
+
+        self.obs = self._get_obs()
+        self.rew = self._compute_rew()
 
         info = {
             "position": self.twip.get_pos(),
