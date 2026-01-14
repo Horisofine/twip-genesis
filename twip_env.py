@@ -12,7 +12,7 @@ class TwipEnv(gym.Env):
         self.device = torch.device("cpu")  # CUDA support
 
         self._max_torque = 10.0
-        self._max_angle = 35.0
+        self._max_angle = 15.0
 
         # Define the spaces
         # Observation space
@@ -61,8 +61,8 @@ class TwipEnv(gym.Env):
             dofs_idx_local=self._motors_dof_idx
         )
 
-        self._init_pos = self.twip.get_pos()
-        self._init_quat = self.twip.get_quat()
+        self._init_pos = self.twip.get_pos().clone()
+        self._init_quat = self.twip.get_quat().clone()
 
     def step(self, action):
         self.action = action * self._max_torque
@@ -76,8 +76,11 @@ class TwipEnv(gym.Env):
         if self.dones:
             self.reset()
 
-        self.obs = self._get_obs()
-        self.rew = self._compute_rew()
+            self.obs = torch.zeros((4,), device=self.device)
+            self.rew = torch.tensor(-1.0, device=self.device)
+        else:
+            self.obs = self._get_obs()
+            self.rew = self._compute_rew()
 
         info = {
             "position": self.twip.get_pos(),
@@ -105,37 +108,46 @@ class TwipEnv(gym.Env):
         pass
 
     def _get_obs(self):
-        curr_pitch = self._get_pitch_ang()
+        curr_yaw, _, _ = self._get_euler_ang()
 
         ang_vel = torch.tensor(self.twip.get_ang(), device=self.device)
-        curr_ang_pitch = ang_vel[2]
+        curr_ang_yaw = ang_vel[0]
 
         dofs_vel = torch.tensor(self.twip.get_dofs_velocity(self._motors_dof_idx), device=self.device)
         left_wheel_vel = dofs_vel[0]
         right_wheel_vel = dofs_vel[1]
 
         return torch.stack([
-            curr_pitch,
-            curr_ang_pitch,
+            curr_yaw,
+            curr_ang_yaw,
             left_wheel_vel,
             right_wheel_vel
         ], dim=0)
 
     def _compute_rew(self):
-        pitch = self._get_pitch_ang()
-        pitch_threshold = torch.deg2rad(torch.tensor(self._max_angle, device=self.device))
-        reward = 1.0 - (torch.abs(pitch) / pitch_threshold)
+        yaw, _, _ = self._get_euler_ang()
+        yaw_threshold = torch.deg2rad(torch.tensor(self._max_angle, device=self.device))
+        reward = 1.0 - (torch.abs(yaw) / yaw_threshold)
         return torch.clamp(reward, 0.0, 1.0)
 
     def _check_dones(self):
-        pitch = self._get_pitch_ang()
-        pitch_threshold = torch.deg2rad(torch.tensor(self._max_angle, device=self.device))
-        return torch.abs(pitch) > pitch_threshold
+        yaw, _, _ = self._get_euler_ang()
+        yaw_threshold = torch.deg2rad(torch.tensor(self._max_angle, device=self.device))
+        return torch.abs(yaw) > yaw_threshold
 
-    def _get_pitch_ang(self):
+    def _get_euler_ang(self):
         quat = torch.tensor(self.twip.get_quat(), device=self.device)
         w, x, y, z = quat[0], quat[1], quat[2], quat[3]
-        t0 = 2.0 * (w * y - z * x)
+        t0 = 2.0 * (w * x + y * z)
         t1 = 1.0 - 2.0 * (y * y + x * x)
-        pitch = torch.atan2(t0, t1)
-        return pitch
+        yaw = torch.atan2(t0, t1)
+
+        t2 = 2.0 * (w * y - z * x)
+        t2 = torch.clamp(t2, -1.0, 1.0)
+        pitch = torch.asin(t2)
+
+        t3 = 2.0 * (w * z + x * y)
+        t4 = 1.0 - 2.0 * (y * y + z * z)
+        roll = torch.atan2(t3, t4)
+
+        return yaw, pitch, roll
