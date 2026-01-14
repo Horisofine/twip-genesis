@@ -5,6 +5,7 @@ import torch
 import genesis as gs
 from gymnasium import spaces
 
+
 class TwipEnv(gym.Env):
     def __init__(self):
         super(TwipEnv, self).__init__()
@@ -12,7 +13,7 @@ class TwipEnv(gym.Env):
         self.device = torch.device("cpu")  # CUDA support
 
         self._max_torque = 10.0
-        self._max_angle = 15.0
+        self._max_yaw = 14.75
 
         # Define the spaces
         # Observation space
@@ -22,8 +23,10 @@ class TwipEnv(gym.Env):
             dtype=np.float32
         )
 
-        self.obs = torch.zeros((4,), device=self.device)
-        self.rew = torch.tensor(0.0, device=self.device)
+        self.num_envs = 32
+
+        self.obs = torch.zeros((self.num_envs, 4), device=self.device)
+        self.rew = torch.zeros((self.num_envs,), device=self.device)
         self.dones = False
         self.truncated = False
 
@@ -33,15 +36,20 @@ class TwipEnv(gym.Env):
             high=np.array([1.0, 1.0], dtype=np.float32),
             dtype=np.float32
         )
-        self.action = torch.zeros((2,), device=self.device)
+        self.action = torch.zeros((self.num_envs, 2), device=self.device)
 
         # Defining the scene
         gs.init(backend=gs.cpu)
         from genesis.engine.entities import RigidEntity
 
+        max_rendered_num_envs = 4
         self.scene = gs.Scene(
             vis_options=gs.options.VisOptions(
-                show_link_frame=True,
+                show_link_frame=False,
+                rendered_envs_idx=torch.randperm(max_rendered_num_envs).tolist(),
+            ),
+            viewer_options=gs.options.ViewerOptions(
+                res=(1200, 800),
             ),
             show_viewer=True
         )
@@ -53,12 +61,14 @@ class TwipEnv(gym.Env):
         self._joints_name = ["lwheel", "rwheel"]
         self._motors_dof_idx = [self.twip.get_joint(name).dof_idx_local for name in self._joints_name]
 
-        self.scene.build()
+        self.scene.build(
+            n_envs=self.num_envs,
+        )
 
         self.twip.set_dofs_force_range(
             lower=-self._max_torque,
             upper=self._max_torque,
-            dofs_idx_local=self._motors_dof_idx
+            dofs_idx_local=self._motors_dof_idx,
         )
 
         self._init_pos = self.twip.get_pos().clone()
@@ -73,14 +83,17 @@ class TwipEnv(gym.Env):
         self.dones = self._check_dones()
         self.truncated = False
 
-        if self.dones:
-            self.reset()
+        # create the env idx tensor for all environments that are done (i.e. are True)
+        done_envs_idx = torch.nonzero(self.dones, as_tuple=False).squeeze(-1)
 
-            self.obs = torch.zeros((4,), device=self.device)
-            self.rew = torch.tensor(-1.0, device=self.device)
-        else:
-            self.obs = self._get_obs()
-            self.rew = self._compute_rew()
+        self.obs = self._get_obs()
+        self.rew = self._compute_rew()
+
+        reset_obs, reset_action, reset_rew = self._reset_envs(envs_idx=done_envs_idx)
+
+        self.obs[done_envs_idx] = reset_obs
+        self.action[done_envs_idx] = reset_action
+        self.rew[done_envs_idx] = reset_rew
 
         info = {
             "position": self.twip.get_pos(),
@@ -90,54 +103,72 @@ class TwipEnv(gym.Env):
 
         return self.obs, self.rew, self.dones, self.truncated, info
 
-    def reset(self, seed=None, options=None):
-        self.twip.set_dofs_position(
-            position=torch.tensor([0, 0], dtype=torch.float32, device=self.device),
-            dofs_idx_local=self._motors_dof_idx,
-            zero_velocity=True
-        )
-        self.twip.set_pos(self._init_pos)
-        self.twip.set_quat(self._init_quat)
+    def reset(self, seed=None, options=None, envs_idx: torch.Tensor | None = None):
+        if envs_idx is None:
+            envs_idx = torch.arange(self.num_envs, device=self.device)
 
-        self.action = torch.zeros((2,), device=self.device)
-        self.obs = torch.zeros((4,), device=self.device)
+        self.obs[envs_idx], self.action[envs_idx], self.rew[envs_idx] = self._reset_envs(envs_idx=envs_idx)
 
         return self.obs, None
 
     def close(self):
         pass
 
+    def _reset_envs(self, envs_idx: torch.Tensor):
+        self.twip.set_dofs_position(
+            position=torch.tensor([0, 0], dtype=torch.float32, device=self.device),
+            dofs_idx_local=self._motors_dof_idx,
+            envs_idx=envs_idx,
+            zero_velocity=True
+        )
+        self.twip.set_pos(
+            self._init_pos[envs_idx],
+            envs_idx=envs_idx,
+        )
+        self.twip.set_quat(
+            self._init_quat[envs_idx],
+            envs_idx=envs_idx,
+        )
+
+        num_reset = len(envs_idx)
+
+        action = torch.zeros((num_reset, 2), device=self.device)
+        obs = torch.zeros((num_reset, 4), device=self.device)
+        rew = -torch.ones((num_reset,), device=self.device)
+
+        return obs, action, rew
+
     def _get_obs(self):
         curr_yaw, _, _ = self._get_euler_ang()
 
         ang_vel = torch.tensor(self.twip.get_ang(), device=self.device)
-        curr_ang_yaw = ang_vel[0]
+        curr_ang_yaw = ang_vel[:, 0]
 
         dofs_vel = torch.tensor(self.twip.get_dofs_velocity(self._motors_dof_idx), device=self.device)
-        left_wheel_vel = dofs_vel[0]
-        right_wheel_vel = dofs_vel[1]
+        left_wheel_vel = dofs_vel[:, 0]
+        right_wheel_vel = dofs_vel[:, 1]
 
         return torch.stack([
             curr_yaw,
             curr_ang_yaw,
             left_wheel_vel,
             right_wheel_vel
-        ], dim=0)
+        ], dim=1)
 
     def _compute_rew(self):
         yaw, _, _ = self._get_euler_ang()
-        yaw_threshold = torch.deg2rad(torch.tensor(self._max_angle, device=self.device))
+        yaw_threshold = torch.deg2rad(torch.tensor(self._max_yaw, device=self.device))
         reward = 1.0 - (torch.abs(yaw) / yaw_threshold)
         return torch.clamp(reward, 0.0, 1.0)
 
     def _check_dones(self):
         yaw, _, _ = self._get_euler_ang()
-        yaw_threshold = torch.deg2rad(torch.tensor(self._max_angle, device=self.device))
+        yaw_threshold = torch.deg2rad(torch.tensor(self._max_yaw, device=self.device))
         return torch.abs(yaw) > yaw_threshold
 
     def _get_euler_ang(self):
         quat = torch.tensor(self.twip.get_quat(), device=self.device)
-        w, x, y, z = quat[0], quat[1], quat[2], quat[3]
+        w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
         t0 = 2.0 * (w * x + y * z)
         t1 = 1.0 - 2.0 * (y * y + x * x)
         yaw = torch.atan2(t0, t1)
