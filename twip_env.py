@@ -1,13 +1,16 @@
 import math
 from typing import Any
 
+import genesis as gs
 import gymnasium as gym
 import numpy as np
 import torch
-import genesis as gs
 from gymnasium import spaces
 from stable_baselines3.common.vec_env import VecEnv
 from stable_baselines3.common.vec_env.base_vec_env import VecEnvIndices
+
+from randomization import random_range
+from utils import rotate_quat_pitch, quat_to_rpy
 
 
 class TwipEnv(VecEnv):
@@ -31,9 +34,9 @@ class TwipEnv(VecEnv):
         self.render_mode = "human"
         self.device = torch.device("cpu")  # CUDA support
 
-        self._max_torque = 10.0
-        self._touchdown_yaw = 14.75  # degrees
-        self._max_yaw = 17.0  # degrees
+        self._max_torque = 10.0 # Nm
+        self._touchdown_roll = math.radians(14.75)
+        self._max_roll = math.radians(17.0)
         self._max_episode_length = 512  # steps
 
         self.obs = torch.zeros((self.num_envs, 4), device=self.device)
@@ -99,12 +102,13 @@ class TwipEnv(VecEnv):
         self.rew = self._compute_rew()
         self.lengths += 1
 
-        reset_obs, reset_action, reset_rew = self._reset_envs(envs_idx=done_envs_idx)
+        if done_envs_idx.numel() > 0:
+            reset_obs, reset_action, reset_rew = self._reset_envs(envs_idx=done_envs_idx)
 
-        self.obs[done_envs_idx] = reset_obs
-        self.actions[done_envs_idx] = reset_action
-        self.rew[done_envs_idx] = reset_rew
-        self.lengths[done_envs_idx] = 0
+            self.obs[done_envs_idx] = reset_obs
+            self.actions[done_envs_idx] = reset_action
+            self.rew[done_envs_idx] = reset_rew
+            self.lengths[done_envs_idx] = 0
 
         infos = []
         for i in range(self.num_envs):
@@ -139,16 +143,23 @@ class TwipEnv(VecEnv):
             zero_velocity=True
         )
 
+        num_reset = len(envs_idx)
+
+        # Position reset
         self.twip.set_pos(
             self._init_pos[envs_idx],
             envs_idx=envs_idx,
         )
+
+        # Orientation reset
+        max_roll = torch.ones((num_reset,), dtype=torch.float32, device=self.device) * self._max_roll
+        random_rolls = random_range(-max_roll, max_roll)
+        reset_quats = rotate_quat_pitch(self._init_quat[envs_idx], random_rolls)
+
         self.twip.set_quat(
-            self._init_quat[envs_idx],
+            reset_quats,
             envs_idx=envs_idx,
         )
-
-        num_reset = len(envs_idx)
 
         action = torch.zeros((num_reset, 2), device=self.device)
         obs = torch.zeros((num_reset, 4), device=self.device)
@@ -157,49 +168,38 @@ class TwipEnv(VecEnv):
         return obs, action, rew
 
     def _get_obs(self):
-        curr_yaw, _, _ = self._get_euler_ang()
+        curr_roll, _, _ = self._get_rpy()
 
         ang_vel = torch.tensor(self.twip.get_ang(), device=self.device)
-        curr_ang_yaw = ang_vel[:, 0]
+        curr_ang_roll = ang_vel[:, 0]
 
         dofs_vel = torch.tensor(self.twip.get_dofs_velocity(self._motors_dof_idx), device=self.device)
         left_wheel_vel = dofs_vel[:, 0]
         right_wheel_vel = dofs_vel[:, 1]
 
         return torch.stack([
-            curr_yaw,
-            curr_ang_yaw,
+            curr_roll,
+            curr_ang_roll,
             left_wheel_vel,
             right_wheel_vel
         ], dim=1)
 
     def _compute_rew(self):
-        yaw, _, _ = self._get_euler_ang()
-        yaw_threshold = torch.deg2rad(torch.tensor(self._touchdown_yaw, device=self.device))
-        reward = 1.0 - (torch.abs(yaw) / yaw_threshold)
+        roll, _, _ = self._get_rpy()
+        roll_threshold = torch.tensor(self._touchdown_roll, device=self.device)
+        reward = 1.0 - (torch.abs(roll) / roll_threshold)
         return torch.clamp(reward, 0.0, 1.0)
 
     def _check_dones(self):
-        yaw, _, _ = self._get_euler_ang()
-        yaw_threshold = torch.deg2rad(torch.tensor(self._max_yaw, device=self.device))
-        return torch.abs(yaw) > yaw_threshold
+        roll, _, _ = self._get_rpy()
+        roll_threshold = torch.tensor(self._max_roll, device=self.device)
+        return torch.abs(roll) > roll_threshold
 
-    def _get_euler_ang(self):
+    def _get_rpy(self):
         quat = torch.tensor(self.twip.get_quat(), device=self.device)
-        w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
-        t0 = 2.0 * (w * x + y * z)
-        t1 = 1.0 - 2.0 * (y * y + x * x)
-        yaw = torch.atan2(t0, t1)
+        rpy = quat_to_rpy(quat)
 
-        t2 = 2.0 * (w * y - z * x)
-        t2 = torch.clamp(t2, -1.0, 1.0)
-        pitch = torch.asin(t2)
-
-        t3 = 2.0 * (w * z + x * y)
-        t4 = 1.0 - 2.0 * (y * y + z * z)
-        roll = torch.atan2(t3, t4)
-
-        return yaw, pitch, roll
+        return rpy[:, 0], rpy[:, 1], rpy[:, 2]
 
     def get_attr(self, attr_name: str, indices: VecEnvIndices = None) -> list[Any]:
         return [getattr(self, attr_name) for _ in range(self.num_envs)]
